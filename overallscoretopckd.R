@@ -1,0 +1,536 @@
+# Load necessary libraries
+options(repos = c(CRAN = "https://cloud.r-project.org"))
+myPaths <- .libPaths()
+myPaths <- c("/n/home_fasse/txia/R/libs", myPaths)  # add new path
+.libPaths(myPaths)  # reassign them
+
+if (!requireNamespace("splines", quietly = TRUE)) {
+  install.packages("splines", lib = "/n/home_fasse/txia/R/libs", repos = "https://cloud.r-project.org")
+}
+
+# Load required packages
+library(splines, lib.loc = "/n/home_fasse/txia/R/libs")
+
+library(glmnet, lib.loc = "/n/home_fasse/txia/R/libs")
+library(dplyr, lib.loc = "/n/home_fasse/txia/R/libs")
+library(data.table, lib.loc = "/n/home_fasse/txia/R/libs")
+library(pROC, lib.loc = "/n/home_fasse/txia/R/libs")
+library(parallel, lib.loc = "/n/home_fasse/txia/R/libs")
+library(survival, lib.loc = "/n/home_fasse/txia/R/libs")
+
+# Load the proteomics annotation file
+print("Loading protein information...")
+proteomics_info <- fread("/n/holylfs05/LABS/liang_lab_l3/Projects/biobank_genomics_l3/UKBiobank/phen45052/Olink_proteomics/Olink_info_11.10.2023.csv")
+
+# Add ".x" to the UniProt column in proteomics_info to match logistic results
+proteomics_info$UniProt <- paste0(proteomics_info$UniProt, ".x")
+
+##################################################
+
+# Function to select UK Biobank fields
+f_select_UKB_field <- function(x, file_output, version = "July_2023") {
+  cat("\nCurrent version: ", version, "\n")
+  f.number = paste0("f.", x, sep = "\\.", collapse = "|")
+  
+  if (version == "July_2023") {
+    df_head <- paste0("/n/home_fasse/txia/UKB_CKM/Data/", version, "_col.txt")
+    if (!file.exists(df_head)) {
+      print("Header file does not exist. Creating it...")
+      df <- fread(paste0("/n/holylfs05/LABS/liang_lab_l3/Projects/biobank_genomics_l3/UKBiobank/phen45052/July_2023_full_data/ukb674044.tab"), nrows = 1, header = FALSE)
+      df <- data.table(t(df), keep.rownames = TRUE)
+      df[, rn := substr(rn, 2, 100)]
+      fwrite(df, df_head, sep = "\t", col.names = FALSE)
+    }
+    cmd <- paste0("egrep   \'", f.number, "\' ", df_head, " > ~/temp.txt")
+  }
+  print(cmd)
+  system(cmd)
+  
+  temp <- fread("~/temp.txt", header = FALSE, sep = "\t")
+  
+  if (version == "July_2023") {
+    cmd <- paste0("cut -f ", paste(c(1, temp$V1), collapse = ","), 
+                  " /n/holylfs05/LABS/liang_lab_l3/Projects/biobank_genomics_l3/UKBiobank/phen45052/July_2023_full_data/ukb674044.tab > ", file_output)
+  }
+  print(cmd)
+  system(cmd)
+  system("rm ~/temp.txt")
+}
+
+# Specify input field IDs and output file paths
+x <- c(
+  # Add your required f.xxx field IDs here
+    132032,
+42026, 131036, 130836, 130838, 130840,
+ 130842, 42018, 42020, 42022, 42024, 130708, 131298, 131300, 131302, 131304, 131306, 131360, 131362, 131366, 131368, 131354, 
+131364,  131296, 131058, 131056, 131386, 131350, 132032, 21842, 40000, 22189, "f.eid", 191, 42000, 42006, 42008, 42010)
+
+file_output <- "/n/home_fasse/txia/UKB_CKM/Data/ckdvariable"
+csv_output <- "/n/home_fasse/txia/UKB_CKM/Data/ckdvariable.csv"
+
+# Apply function to select fields and save the output
+f_select_UKB_field(x, file_output, version = "July_2023")
+
+# Read the selected data into R
+ukb_selected_data <- fread(file_output)
+
+# Write the selected data to a CSV file
+write.table(ukb_selected_data, file = csv_output, row.names = FALSE, quote = FALSE, col.names = TRUE, sep = ",")
+
+# Load the dataset
+ckd_association <- fread("/n/home_fasse/txia/UKB_CKM/Data/ukb_filtered_with_polr_manual_protein_score.csv")
+ukb_data <- fread("/n/home_fasse/txia/UKB_CKM/Data/ckdvariable.csv")
+
+
+ckd_association$sbp_use <- ifelse(!is.na(ckd_association$f.4080.0.0.x), ckd_association$f.4080.0.0.x, ckd_association$f.93.0.0.x)
+summary(ckd_association$sbp_use)
+
+table(ckd_association$sex.x)
+table(ckd_association$sex.y)
+
+
+# Remove rows with missing 'ckm'
+ckd_association <- ckd_association[!is.na(ckd_association$ckm), ] 
+
+summary(ckd_association$protein_score)
+sd(ckd_association$protein_score, na.rm = TRUE)
+
+ckd_association$protein_score<-ckd_association$manual_protein_score_top
+
+# Standardize protein_score to mean = 0, SD = 1
+#ckd_association[, protein_score := scale(protein_score)]
+ckd_association[, protein_score := qnorm(rank(protein_score, na.last = "keep") / (.N + 1))]
+
+
+summary(ckd_association$protein_score)
+sd(ckd_association$protein_score, na.rm = TRUE)
+
+
+
+
+# Join the datasets by participant ID (assuming 'f.eid' is the ID column in both)
+ckd_association <- ckd_association %>%
+  left_join(ukb_data, by = "f.eid")
+
+# Define ckd-related outcomes (exclude CKD-related outcomes)
+ckd_outcomes <- c(
+  "f.132032.0.0", "f.42026.0.0"
+  
+)
+
+# Convert date fields to numeric (dates are assumed to be in YYYY-MM-DD format)
+for (outcome in ckd_outcomes) {
+  ckd_association[[outcome]] <- as.numeric(as.Date(ckd_association[[outcome]]))
+}
+
+# Define baseline visit date (assumed to be stored in `f.21842`)
+ckd_association$dt_visit0 <- as.numeric(as.Date(ckd_association$f.21842.0.0))
+
+# Step 1: Identify first ckd diagnosis date and handle Inf values
+ckd_association$ckd_dxdt <- apply(
+  as.matrix(ckd_association[, ..ckd_outcomes]), 
+  1, 
+  function(x) {
+    min_val <- min(x, na.rm = TRUE)  # Find the earliest non-NA diagnosis date
+    if (is.infinite(min_val)) NA else min_val  # Replace Inf with NA
+  }
+)
+
+# Replace NA with Inf where required explicitly for handling missing cases
+ckd_association$ckd_dxdt[is.na(ckd_association$ckd_dxdt)] <- Inf
+
+# Step 2: Determine baseline ckd (prevalent cases: diagnosis before baseline visit)
+ckd_association$ckd_bsln <- ifelse(
+  ckd_association$ckd_dxdt < ckd_association$dt_visit0,
+  1, 0
+)
+
+# Step 3: Exclude participants with baseline ckd
+incident_data <- ckd_association %>%
+  filter(ckd_bsln == 0)
+
+#############delete ckm 4
+incident_data <-incident_data[ckm != 4]
+
+# Step 4: Define incident ckd and censoring
+incident_data <- incident_data %>%
+  mutate(
+    incident_ckd_time = ckd_dxdt,  # First ckd diagnosis after baseline
+    event = ifelse(!is.na(incident_ckd_time) & incident_ckd_time != Inf, 1, 0),  # Event indicator: 1 if incident ckd occurred
+    censor_time = pmin(as.numeric(as.Date(f.40000.0.0)), as.numeric(as.Date(f.191.0.0)), as.numeric(as.Date("2022-11-30")), na.rm = TRUE),  # Censor at death or current date
+    time_to_event = ifelse(event == 1, incident_ckd_time - dt_visit0, censor_time - dt_visit0)  # Time to event or censoring
+  )
+
+# Check the event distribution
+print("Baseline and incident ckd have been defined successfully.")
+print(table(incident_data$event))  # Check event distribution
+
+# Save the processed dataset for downstream analysis
+#processed_output <- "/n/home_fasse/txia/UKB_CKM/Data/processed_ckd_data.csv"
+#write.table(incident_data, file = processed_output, row.names = FALSE, quote = FALSE, col.names = TRUE, sep = ",")
+
+#print("Processed ckd data saved successfully.")
+
+
+
+
+# Ensure categorical covariates are factors
+incident_data$sex.y       <- as.factor(incident_data$sex.y)
+incident_data$nonwhite    <- as.factor(incident_data$nonwhite)
+incident_data$fast_hrs    <- as.factor(incident_data$fast_hrs)
+
+incident_data$alcohol_cat <- as.factor(incident_data$alcohol_cat)
+incident_data$smoke       <- as.factor(incident_data$smoke)
+
+
+# Step: Add Continuous, Tertile, and Spline Models for protein_score and Threshold Scores
+print("Running all Cox models for continuous, tertile, and spline protein scores...")
+
+# List of protein score variants
+protein_scores <- c("protein_score")
+
+# Initialize combined result tables
+all_proteomics_score_results <- data.frame()
+all_tertile_results <- data.frame()
+
+library(splines)
+
+run_models_on_subset <- function(data, label) {
+  # Ensure factor variables are properly set
+  data$sex.y <- as.factor(data$sex.y)
+  data$nonwhite <- as.factor(data$nonwhite)
+   data$fast_hrs <- as.factor(data$fast_hrs)
+   
+  data$alcohol_cat <- as.factor(data$alcohol_cat)
+  data$smoke <- as.factor(data$smoke)
+
+  for (score_var in protein_scores) {
+    print(paste("Processing:", score_var, "in group", label))
+
+       ### 1. Continuous Cox Models
+    for (i in 1:3) {
+      if (i == 1) {
+        model <- coxph(Surv(time_to_event, event) ~ get(score_var) + age.y + sex.y, data = data)
+      } else if (i == 2) {
+        model <- coxph(Surv(time_to_event, event) ~ get(score_var) + age.y + sex.y + nonwhite +fast_hrs+ townsend + smoke + PA + BMI + alcohol_cat, data = data)
+      } else if (i == 3) {
+        model <- coxph(Surv(time_to_event, event) ~ get(score_var) + age.y + sex.y + nonwhite +fast_hrs+ townsend + smoke + PA + BMI + alcohol_cat + sbp_use +  f.30690.0.0.x + f.30760.0.0.x +  f.30740.0.0.x + eGFR, data = data)
+      }
+
+      coef_val <- coef(model)[1]
+      se_val <- sqrt(diag(vcov(model)))[1]
+      hr <- exp(coef_val)
+      p_val <- summary(model)$coef[1, "Pr(>|z|)"]
+      lower_ci <- exp(coef_val - 1.96 * se_val)
+      upper_ci <- exp(coef_val + 1.96 * se_val)
+
+      all_proteomics_score_results <<- rbind(all_proteomics_score_results, data.frame(
+        Group = label,
+        Score = score_var,
+        Model = paste0("Model ", i),
+        Coefficient = coef_val,
+        Hazard_Ratio = hr,
+        CI_95_Lower = lower_ci,
+        CI_95_Upper = upper_ci,
+        SE = se_val,
+        P_Value = p_val,
+        Bonferroni_P = p.adjust(p_val, method = "bonferroni"),
+        FDR = p.adjust(p_val, method = "fdr")
+      ))
+    }
+
+    ### 2. Tertile Models
+    tertile_var <- paste0(score_var, "_tertile")
+    data[[tertile_var]] <- cut(
+      data[[score_var]],
+ breaks = quantile(data[[score_var]], probs = seq(0, 1, by = 0.1), na.rm = TRUE),
+  labels = paste0("D", 1:10),
+      include.lowest = TRUE
+    )
+    data[[tertile_var]] <- relevel(as.factor(data[[tertile_var]]), ref = "D1")
+
+       for (i in 1:3) {
+      if (i == 1) {
+        model <- coxph(Surv(time_to_event, event) ~ get(tertile_var) + age.y + sex.y, data = data)
+      } else if (i == 2) {
+        model <- coxph(Surv(time_to_event, event) ~ get(tertile_var) + age.y + sex.y + nonwhite +fast_hrs+ townsend + smoke + PA + BMI + alcohol_cat, data = data)
+      } else if (i == 3) {
+        model <- coxph(Surv(time_to_event, event) ~ get(tertile_var) + age.y + sex.y + nonwhite +fast_hrs+ townsend + smoke + PA + BMI + alcohol_cat + sbp_use +  f.30690.0.0.x + f.30760.0.0.x +  f.30740.0.0.x + eGFR, data = data)
+      }
+      
+      model_summary <- summary(model)$coef
+      model_confint <- confint(model)
+
+      for (j in 1:nrow(model_summary)) {
+        all_tertile_results <<- rbind(all_tertile_results, data.frame(
+          Group = label,
+          Score = score_var,
+          Model = paste0("Model ", i),
+          Comparison = rownames(model_summary)[j],
+          HR = exp(model_summary[j, "coef"]),
+          CI_95_Lower = exp(model_confint[j, 1]),
+          CI_95_Upper = exp(model_confint[j, 2]),
+          SE = model_summary[j, "se(coef)"],
+          P_Value = model_summary[j, "Pr(>|z|)"]
+        ))
+      }
+    }
+
+    ### 3. Spline Model
+    ref_sex <- levels(data$sex.y)[1]
+    ref_nonwhite <- levels(data$nonwhite)[1]
+    ref_fast_hrs <- levels(data$fast_hrs)[1]
+    
+    ref_alcohol <- levels(data$alcohol_cat)[1]
+    ref_smoke<- levels(data$smoke)[1]
+
+
+spline_model <- coxph(Surv(time_to_event, event) ~ ns(get(score_var), df = 4) + 
+  age.y + sex.y + nonwhite +fast_hrs + townsend + smoke + PA + BMI + alcohol_cat + sbp_use +  f.30690.0.0.x + f.30760.0.0.x +  f.30740.0.0.x + eGFR, 
+  data = data)
+
+
+# Use full score range from full dataset
+min_val <- min(data[[score_var]], na.rm = TRUE)
+max_val <- max(data[[score_var]], na.rm = TRUE)
+
+new_data <- data.frame(score = seq(min_val, max_val, length.out = 100))
+colnames(new_data)[1] <- score_var
+
+# Set covariates
+new_data$age.y <- median(data$age.y, na.rm = TRUE)
+new_data$sex.y <- factor(rep(levels(data$sex.y)[1], 100), levels = levels(data$sex.y))
+new_data$nonwhite <- factor(rep(levels(data$nonwhite)[1], 100), levels = levels(data$nonwhite))
+new_data$fast_hrs <- factor(rep(levels(data$fast_hrs)[1], 100), levels = levels(data$fast_hrs))
+
+new_data$townsend <- median(data$townsend, na.rm = TRUE)
+new_data$smoke <- factor(rep(levels(data$smoke)[1], 100), levels = levels(data$smoke))
+new_data$PA <- median(data$PA, na.rm = TRUE)
+new_data$BMI <- median(data$BMI, na.rm = TRUE)
+new_data$alcohol_cat <- factor(rep(levels(data$alcohol_cat)[1], 100), levels = levels(data$alcohol_cat))
+
+new_data$sbp_use <- median(as.numeric(data$sbp_use), na.rm = TRUE)
+
+new_data$`f.30690.0.0.x` <- median(as.numeric(data$`f.30690.0.0.x`), na.rm = TRUE)
+
+new_data$`f.30760.0.0.x` <- median(as.numeric(data$`f.30760.0.0.x`), na.rm = TRUE)
+
+new_data$`f.30740.0.0.x` <- median(as.numeric(data$`f.30740.0.0.x`), na.rm = TRUE)
+
+new_data$eGFR <- median(as.numeric(data$eGFR), na.rm = TRUE)
+
+
+# Predict log(HR) and calculate CI correctly
+spline_pred <- predict(spline_model, newdata = new_data, type = "lp", se.fit = TRUE)
+
+new_data$HR <- exp(spline_pred$fit)
+new_data$HR_lower <- exp(spline_pred$fit - 1.96 * spline_pred$se.fit)
+new_data$HR_upper <- exp(spline_pred$fit + 1.96 * spline_pred$se.fit)
+
+
+
+    fwrite(new_data, paste0("/n/home_fasse/txia/UKB_CKM/Data/spline_ckd_overallscoretop_", score_var, "_model3_", label, ".csv"))
+  }
+}
+
+# Apply the function to all data and stratified by drug use
+run_models_on_subset(incident_data, "overall")
+run_models_on_subset(subset(incident_data, bptreat.y == 0 & statin.y == 0), "nodrug")
+run_models_on_subset(subset(incident_data, bptreat.y == 1 | statin.y == 1), "drug")
+
+
+# Run all models stratified by CKM stage (0–4)
+for (ckm_stage in 0:3) {
+  ckm_data <- subset(incident_data, ckm == ckm_stage)
+  run_models_on_subset(ckm_data, paste0("ckm", ckm_stage))
+}
+
+
+# Adjust p-values for the full result
+all_tertile_results$Bonferroni_P <- p.adjust(all_tertile_results$P_Value, method = "bonferroni")
+all_tertile_results$FDR <- p.adjust(all_tertile_results$P_Value, method = "fdr")
+
+# Export results
+write.csv(
+  all_proteomics_score_results,
+  "/n/home_fasse/txia/UKB_CKM/Data/ckd_overallscoretop_all_models_all_thresholds_stratified.csv",
+  row.names = FALSE
+)
+
+write.csv(
+  all_tertile_results,
+  "/n/home_fasse/txia/UKB_CKM/Data/ckd_overallscoretop_tertile_models_all_thresholds_stratified.csv",
+  row.names = FALSE
+)
+
+print("Completed all models for all protein score thresholds including spline models, stratified by drug use.")
+
+
+#########EVENT AND TIME DISTIRBUTION
+library(dplyr)
+library(survival)
+
+# Choose the protein score of interest (e.g., "protein_score")
+score_var <- "protein_score"
+
+# Create tertiles based on the full dataset
+incident_data <- incident_data %>%
+  mutate(
+    tertile = cut(
+      .data[[score_var]],
+      breaks = quantile(.data[[score_var]], probs = seq(0, 1, by = 0.1), na.rm = TRUE),
+labels = paste0("D", 1:10),
+      include.lowest = TRUE
+    )
+  )
+
+# 1. Overall event distribution summary
+overall_summary <- incident_data %>%
+  summarise(
+    N_total = n(),
+    N_events = sum(event == 1, na.rm = TRUE),
+    Event_rate = mean(event == 1, na.rm = TRUE),
+    Time_to_event_mean = mean(time_to_event, na.rm = TRUE),
+    Time_to_event_median = median(time_to_event, na.rm = TRUE)
+  )
+
+# 2. By tertile of protein score
+tertile_summary <- incident_data %>%
+  group_by(tertile) %>%
+  summarise(
+    N = n(),
+    Events = sum(event == 1, na.rm = TRUE),
+    Event_rate = mean(event == 1, na.rm = TRUE),
+    Time_to_event_mean = mean(time_to_event, na.rm = TRUE),
+    Time_to_event_median = median(time_to_event, na.rm = TRUE)
+  )
+
+# Print results
+cat("==== Overall Summary ====\n")
+print(overall_summary)
+
+cat("\n==== Summary by Protein Score Tertile ====\n")
+print(tertile_summary)
+
+
+##############check baseline characteristic by score
+incident_data <- incident_data %>%
+  mutate(
+    protein_score_group = case_when(
+      protein_score < -2 ~ "< -2",
+      protein_score >= -2 & protein_score <= 2 ~ "-2 to 2",
+      protein_score > 2 ~ "> 2"
+    )
+  )
+
+
+summary_table <- incident_data %>%
+  group_by(protein_score_group) %>%
+  summarize(
+    n = n(),
+    mean_age = mean(age.y, na.rm = TRUE),
+    sd_age = sd(age.y, na.rm = TRUE),
+    mean_townsend = mean(townsend, na.rm = TRUE),
+    sd_townsend = sd(townsend, na.rm = TRUE),
+    mean_PA = mean(PA, na.rm = TRUE),
+    sd_PA = sd(PA, na.rm = TRUE),
+    mean_BMI = mean(BMI, na.rm = TRUE),
+    sd_BMI = sd(BMI, na.rm = TRUE),
+    
+      mean_sbp_use        = mean(sbp_use, na.rm = TRUE),
+sd_sbp_use          = sd(sbp_use, na.rm = TRUE),
+
+mean_f30690_0_0_x   = mean(`f.30690.0.0.x`, na.rm = TRUE),
+sd_f30690_0_0_x     = sd(`f.30690.0.0.x`, na.rm = TRUE),
+
+mean_f30760_0_0_x   = mean(`f.30760.0.0.x`, na.rm = TRUE),
+sd_f30760_0_0_x     = sd(`f.30760.0.0.x`, na.rm = TRUE),
+
+mean_f30740_0_0_x   = mean(`f.30740.0.0.x`, na.rm = TRUE),
+sd_f30740_0_0_x     = sd(`f.30740.0.0.x`, na.rm = TRUE),
+
+mean_eGFR           = mean(eGFR, na.rm = TRUE),
+sd_eGFR             = sd(eGFR, na.rm = TRUE)
+  )
+
+# Print the full table with all columns shown
+print(summary_table, width = Inf)
+
+
+# SEX
+incident_data %>%
+  group_by(protein_score_group, sex.y) %>%
+  summarize(n = n()) %>%
+  group_by(protein_score_group) %>%
+  mutate(percent = round(n / sum(n) * 100, 1))
+
+# NONWHITE
+incident_data %>%
+  group_by(protein_score_group, nonwhite) %>%
+  summarize(n = n()) %>%
+  group_by(protein_score_group) %>%
+  mutate(percent = round(n / sum(n) * 100, 1))
+  
+  # fast_hrs
+incident_data %>%
+  group_by(protein_score_group, fast_hrs) %>%
+  summarize(n = n()) %>%
+  group_by(protein_score_group) %>%
+  mutate(percent = round(n / sum(n) * 100, 1))
+
+# SMOKING
+incident_data %>%
+  group_by(protein_score_group, smoke) %>%
+  summarize(n = n()) %>%
+  group_by(protein_score_group) %>%
+  mutate(percent = round(n / sum(n) * 100, 1))
+
+# ALCOHOL
+incident_data %>%
+  group_by(protein_score_group, alcohol_cat) %>%
+  summarize(n = n()) %>%
+  group_by(protein_score_group) %>%
+  mutate(percent = round(n / sum(n) * 100, 1))
+
+#####ckd case
+# ckd
+incident_data %>%
+  group_by(protein_score_group, event) %>%
+  summarize(n = n()) %>%
+  group_by(protein_score_group) %>%
+  mutate(percent = round(n / sum(n) * 100, 1))
+
+
+
+########summary of protein score
+# 1. Basic summary
+summary_stats <- summary(incident_data$protein_score)
+
+# 2. Compute IQR and outlier bounds (boxplot method)
+Q1 <- summary_stats["1st Qu."]
+Q3 <- summary_stats["3rd Qu."]
+IQR <- Q3 - Q1
+lower_bound <- Q1 - 1.5 * IQR
+upper_bound <- Q3 + 1.5 * IQR
+
+# 3. Identify outliers
+outliers <- incident_data$protein_score[
+  incident_data$protein_score < lower_bound |
+  incident_data$protein_score > upper_bound
+]
+
+# 4. Compute 1st and 99th percentiles
+p1 <- quantile(incident_data$protein_score, 0.01, na.rm = TRUE)
+p99 <- quantile(incident_data$protein_score, 0.99, na.rm = TRUE)
+
+# 5. Display everything
+cat("=== Summary ===\n")
+print(summary_stats)
+
+cat("\n=== 1st and 99th Percentiles ===\n")
+cat("1% percentile:", round(p1, 4), "\n")
+cat("99% percentile:", round(p99, 4), "\n")
+
+cat("\n=== Outliers Based on IQR Rule ===\n")
+print(outliers)  
+

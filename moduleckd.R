@@ -1,0 +1,303 @@
+# Load necessary libraries
+options(repos = c(CRAN = "https://cloud.r-project.org"))
+myPaths <- .libPaths()
+myPaths <- c("/n/home_fasse/txia/R/libs", myPaths)  # Add new path
+.libPaths(myPaths)  # Reassign them
+
+library(glmnet, lib.loc = "/n/home_fasse/txia/R/libs")
+library(dplyr, lib.loc = "/n/home_fasse/txia/R/libs")
+library(data.table, lib.loc = "/n/home_fasse/txia/R/libs")
+library(pROC, lib.loc = "/n/home_fasse/txia/R/libs")
+library(parallel, lib.loc = "/n/home_fasse/txia/R/libs")
+library(survival, lib.loc = "/n/home_fasse/txia/R/libs")
+
+# Step 1: Load the proteomics annotation file
+print("Loading protein information...")
+proteomics_info <- fread("/n/holylfs05/LABS/liang_lab_l3/Projects/biobank_genomics_l3/UKBiobank/phen45052/Olink_proteomics/Olink_info_11.10.2023.csv")
+print("Proteomics info loaded.")
+print(paste("Number of rows in proteomics_info:", nrow(proteomics_info)))
+print(paste("Columns in proteomics_info:", paste(colnames(proteomics_info), collapse = ", ")))
+
+# Add ".x" to the UniProt column in proteomics_info to match logistic results
+proteomics_info$UniProt <- paste0(proteomics_info$UniProt, ".x")
+print("Updated UniProt identifiers in proteomics_info.")
+
+# Step 2: Load the dataset
+print("Loading UKB datasets...")
+data1 <- fread("/n/home_fasse/txia/UKB_CKM/Data/combined_proteomics_pheno.csv")
+print("Data1 loaded.")
+print(paste("Number of rows in data1:", nrow(data1)))
+data2 <- fread("/n/home_fasse/txia/UKB_CKM/Data/covariate.csv")
+print("Data2 loaded.")
+print(paste("Number of rows in data2:", nrow(data2)))
+
+# Merge datasets
+ukb <- data1 %>% left_join(data2, by = "f.eid")
+print("Datasets merged.")
+print(paste("Number of rows in ukb:", nrow(ukb)))
+print("Columns in ukb:")
+print(colnames(ukb))
+
+ukb$sbp_use <- ifelse(!is.na(ukb$f.4080.0.0.x), ukb$f.4080.0.0.x, ukb$f.93.0.0.x)
+summary(ukb$sbp_use)
+
+# Remove rows with missing 'ckm'
+ukb <- ukb[!is.na(ukb$ckm), ]
+print(paste("Number of rows in ukb after removing missing 'ckm':", nrow(ukb)))
+
+
+
+##################################################
+
+# Function to select UK Biobank fields
+f_select_UKB_field <- function(x, file_output, version = "July_2023") {
+  cat("\nCurrent version: ", version, "\n")
+  f.number = paste0("f.", x, sep = "\\.", collapse = "|")
+  
+  if (version == "July_2023") {
+    df_head <- paste0("/n/home_fasse/txia/UKB_CKM/Data/", version, "_col.txt")
+    if (!file.exists(df_head)) {
+      print("Header file does not exist. Creating it...")
+      df <- fread(paste0("/n/holylfs05/LABS/liang_lab_l3/Projects/biobank_genomics_l3/UKBiobank/phen45052/July_2023_full_data/ukb674044.tab"), nrows = 1, header = FALSE)
+      df <- data.table(t(df), keep.rownames = TRUE)
+      df[, rn := substr(rn, 2, 100)]
+      fwrite(df, df_head, sep = "\t", col.names = FALSE)
+    }
+    cmd <- paste0("egrep   \'", f.number, "\' ", df_head, " > ~/temp.txt")
+  }
+  print(cmd)
+  system(cmd)
+  
+  temp <- fread("~/temp.txt", header = FALSE, sep = "\t")
+  
+  if (version == "July_2023") {
+    cmd <- paste0("cut -f ", paste(c(1, temp$V1), collapse = ","), 
+                  " /n/holylfs05/LABS/liang_lab_l3/Projects/biobank_genomics_l3/UKBiobank/phen45052/July_2023_full_data/ukb674044.tab > ", file_output)
+  }
+  print(cmd)
+  system(cmd)
+  system("rm ~/temp.txt")
+}
+
+# Specify input field IDs and output file paths
+x <- c(
+  # Add your required f.xxx field IDs here
+    132032,
+42026, 131036, 130836, 130838, 130840,
+ 130842, 42018, 42020, 42022, 42024, 130708, 131298, 131300, 131302, 131304, 131306, 131360, 131362, 131366, 131368, 131354, 
+131364,  131296, 131058, 131056, 131386, 131350, 132032, 21842, 40000, 22189, "f.eid", 191, 42000, 42006, 42008, 42010)
+
+file_output <- "/n/home_fasse/txia/UKB_CKM/Data/ckdvariable"
+csv_output <- "/n/home_fasse/txia/UKB_CKM/Data/ckdvariable.csv"
+
+# Apply function to select fields and save the output
+f_select_UKB_field(x, file_output, version = "July_2023")
+
+# Read the selected data into R
+ukb_selected_data <- fread(file_output)
+
+# Write the selected data to a CSV file
+write.table(ukb_selected_data, file = csv_output, row.names = FALSE, quote = FALSE, col.names = TRUE, sep = ",")
+
+# Load the dataset
+ckd_association <- fread("/n/home_fasse/txia/UKB_CKM/Data/ukb_filtered_with_polr_manual_protein_score.csv")
+ukb_data <- fread("/n/home_fasse/txia/UKB_CKM/Data/ckdvariable.csv")
+
+
+ckd_association$sbp_use <- ifelse(!is.na(ckd_association$f.4080.0.0.x), ckd_association$f.4080.0.0.x, ckd_association$f.93.0.0.x)
+summary(ckd_association$sbp_use)
+
+# Remove rows with missing 'ckm'
+ckd_association <- ckd_association[!is.na(ckd_association$ckm), ] 
+
+summary(ckd_association$protein_score)
+sd(ckd_association$protein_score, na.rm = TRUE)
+
+ckd_association$protein_score<-ckd_association$manual_protein_score
+
+# Standardize protein_score to mean = 0, SD = 1
+#ckd_association[, protein_score := scale(protein_score)]
+ckd_association[, protein_score := qnorm(rank(protein_score, na.last = "keep") / (.N + 1))]
+
+
+summary(ckd_association$protein_score)
+sd(ckd_association$protein_score, na.rm = TRUE)
+
+
+
+
+# Join the datasets by participant ID (assuming 'f.eid' is the ID column in both)
+ckd_association <- ckd_association %>%
+  left_join(ukb_data, by = "f.eid")
+
+# Define ckd-related outcomes (exclude CKD-related outcomes)
+ckd_outcomes <- c(
+  "f.132032.0.0", "f.42026.0.0"
+  
+)
+
+# Convert date fields to numeric (dates are assumed to be in YYYY-MM-DD format)
+for (outcome in ckd_outcomes) {
+  ckd_association[[outcome]] <- as.numeric(as.Date(ckd_association[[outcome]]))
+}
+
+# Define baseline visit date (assumed to be stored in `f.21842`)
+ckd_association$dt_visit0 <- as.numeric(as.Date(ckd_association$f.21842.0.0))
+
+# Step 1: Identify first ckd diagnosis date and handle Inf values
+ckd_association$ckd_dxdt <- apply(
+  as.matrix(ckd_association[, ..ckd_outcomes]), 
+  1, 
+  function(x) {
+    min_val <- min(x, na.rm = TRUE)  # Find the earliest non-NA diagnosis date
+    if (is.infinite(min_val)) NA else min_val  # Replace Inf with NA
+  }
+)
+
+# Replace NA with Inf where required explicitly for handling missing cases
+ckd_association$ckd_dxdt[is.na(ckd_association$ckd_dxdt)] <- Inf
+
+# Step 2: Determine baseline ckd (prevalent cases: diagnosis before baseline visit)
+ckd_association$ckd_bsln <- ifelse(
+  ckd_association$ckd_dxdt < ckd_association$dt_visit0,
+  1, 0
+)
+
+# Step 3: Exclude participants with baseline ckd
+incident_data <- ckd_association %>%
+  filter(ckd_bsln == 0)
+
+ #############delete ckm 4
+        incident_data <-incident_data[ckm != 4]
+
+# Step 4: Define incident ckd and censoring
+incident_data <- incident_data %>%
+  mutate(
+    incident_ckd_time = ckd_dxdt,  # First ckd diagnosis after baseline
+    event = ifelse(!is.na(incident_ckd_time) & incident_ckd_time != Inf, 1, 0),  # Event indicator: 1 if incident ckd occurred
+    censor_time = pmin(as.numeric(as.Date(f.40000.0.0)), as.numeric(as.Date(f.191.0.0)), as.numeric(as.Date("2022-11-30")), na.rm = TRUE),  # Censor at death or current date
+    time_to_event = ifelse(event == 1, incident_ckd_time - dt_visit0, censor_time - dt_visit0)  # Time to event or censoring
+  )
+
+# Check the event distribution
+print("Baseline and incident ckd have been defined successfully.")
+print(table(incident_data$event))  # Check event distribution
+
+
+
+incident_data$sex.y <- as.factor(incident_data$sex.y)
+incident_data$nonwhite <- as.factor(incident_data$nonwhite)
+incident_data$fast_hrs <- as.factor(incident_data$fast_hrs)
+
+incident_data$alcohol_cat <- as.factor(incident_data$alcohol_cat)
+incident_data$smoke <- as.factor(incident_data$smoke)
+
+# MODULE SCORE ANALYSIS
+
+# Load the required module score file
+module_scores <- fread("/n/home_fasse/txia/UKB_CKM/Data/module_scores.csv")
+
+#Standardize module scores (excluding 'f.eid')
+module_names <- colnames(module_scores)[-1]  # All except f.eid
+module_scores[, (module_names) := lapply(.SD, scale), .SDcols = module_names]
+
+
+incident_data <- incident_data %>%
+  left_join(module_scores, by = "f.eid")
+
+# List of module scores to analyze (columns starting with "comm" for clusters)
+module_columns <- grep("^comm\\d+_weights$", colnames(incident_data), value = TRUE)
+
+
+
+
+
+# Prepare storage for results
+module_results <- data.frame()
+decile_results <- data.frame()
+
+# Loop over each module cluster and perform analysis
+for (module in module_columns) {
+  print(paste("Analyzing module:", module))
+
+  ### Per-SD Cox models (continuous)
+  model1 <- coxph(Surv(time_to_event, event) ~ get(module) + age.y + sex.y, data = incident_data)
+  model2 <- coxph(Surv(time_to_event, event) ~ get(module) + age.y + sex.y + nonwhite +fast_hrs+ townsend + smoke + PA + BMI + alcohol_cat, data = incident_data)
+  model3 <- coxph(Surv(time_to_event, event) ~ get(module) + age.y + sex.y + nonwhite +fast_hrs+ townsend + smoke + PA + BMI + alcohol_cat +sbp_use +  f.30690.0.0.x + f.30760.0.0.x +  f.30740.0.0.x + eGFR, data = incident_data)
+
+  models <- list(model1, model2, model3)
+  for (i in seq_along(models)) {
+    model <- models[[i]]
+    coef_val <- coef(model)[1]
+    se_val <- sqrt(diag(vcov(model)))[1]
+    hr <- exp(coef_val)
+    p_val <- summary(model)$coef[1, "Pr(>|z|)"]
+    lower_ci <- exp(coef_val - 1.96 * se_val)
+    upper_ci <- exp(coef_val + 1.96 * se_val)
+
+    module_results <- rbind(module_results, data.frame(
+      Module = module,
+      Model = paste0("Model ", i),
+      Coefficient = coef_val,
+      Hazard_Ratio = hr,
+      CI_95_Lower = lower_ci,
+      CI_95_Upper = upper_ci,
+      SE = se_val,
+      P_Value = p_val
+    ))
+  }
+
+  ### Decile models
+  decile_var <- paste0(module, "_decile")
+  incident_data[[decile_var]] <- cut(
+    incident_data[[module]],
+    breaks = quantile(incident_data[[module]], probs = seq(0, 1, by = 0.1), na.rm = TRUE),
+    labels = paste0("D", 1:10),
+    include.lowest = TRUE
+  )
+  incident_data[[decile_var]] <- relevel(as.factor(incident_data[[decile_var]]), ref = "D1")
+
+  for (i in 1:3) {
+    if (i == 1) {
+      model <- coxph(Surv(time_to_event, event) ~ get(decile_var) + age.y + sex.y, data = incident_data)
+    } else if (i == 2) {
+      model <- coxph(Surv(time_to_event, event) ~ get(decile_var) + age.y + sex.y + nonwhite +fast_hrs+ townsend + smoke + PA + BMI + alcohol_cat, data = incident_data)
+    } else if (i == 3) {
+      model <- coxph(Surv(time_to_event, event) ~ get(decile_var) + age.y + sex.y + nonwhite +fast_hrs+ townsend + smoke + PA + BMI + alcohol_cat +sbp_use +  f.30690.0.0.x + f.30760.0.0.x +  f.30740.0.0.x + eGFR, data = incident_data)
+    }
+
+    model_summary <- summary(model)$coef
+    model_confint <- confint(model)
+
+    for (j in 1:nrow(model_summary)) {
+      decile_results <- rbind(decile_results, data.frame(
+        Module = module,
+        Model = paste0("Model ", i),
+        Comparison = rownames(model_summary)[j],
+        HR = exp(model_summary[j, "coef"]),
+        CI_95_Lower = exp(model_confint[j, 1]),
+        CI_95_Upper = exp(model_confint[j, 2]),
+        SE = model_summary[j, "se(coef)"],
+        P_Value = model_summary[j, "Pr(>|z|)"]
+      ))
+    }
+  }
+}
+
+# Multiple testing correction for per-SD results
+module_results <- module_results %>%
+  group_by(Model) %>%
+  mutate(
+    Bonferroni_P = p.adjust(P_Value, method = "bonferroni"),
+    FDR = p.adjust(P_Value, method = "fdr")
+  ) %>%
+  ungroup()
+
+# Save all results
+write.csv(module_results, "/n/home_fasse/txia/UKB_CKM/Data/ckd_module_association_all_models.csv", row.names = FALSE)
+write.csv(decile_results, "/n/home_fasse/txia/UKB_CKM/Data/ckd_module_decile_models.csv", row.names = FALSE)
+
+# Completion message
+print("ckd module score analysis (per-SD and decile) completed and saved.")
+
+
