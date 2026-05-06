@@ -185,6 +185,9 @@ censor_time = pmin(as.numeric(as.Date(f.40000.0.0)), as.numeric(as.Date(f.191.0.
     time_to_event = ifelse(event == 1, incident_ckd_time - dt_visit0, censor_time - dt_visit0)  # Time to event or censoring
   )
 
+# Treat CKM stage as a categorical variable for Model 4
+incident_data$ckm <- as.factor(incident_data$ckm)
+
 # Check the event distribution
 print("Baseline and incident ckd have been defined successfully.")
 print(table(incident_data$event))  # Check event distribution
@@ -239,11 +242,12 @@ for (threshold in thresholds) {
   for (protein in valid_proteins) {
     # Fit Cox models
     model1 <- coxph(Surv(time_to_event, event) ~ get(protein) + age.y + sex.y, data = incident_data)
-    model2 <- coxph(Surv(time_to_event, event) ~ get(protein) + age.y + sex.y + nonwhite +fast_hrs+ townsend + smoke + PA + BMI+ alcohol_cat, data = incident_data)
+    model2 <- coxph(Surv(time_to_event, event) ~ get(protein) + age.y + sex.y + nonwhite +fast_hrs+ townsend  + PA + alcohol_cat, data = incident_data)
     model3 <- coxph(Surv(time_to_event, event) ~ get(protein) + age.y + sex.y + nonwhite +fast_hrs+ townsend + smoke + PA + BMI+ alcohol_cat +sbp_use +  f.30690.0.0.x + f.30760.0.0.x +  f.30740.0.0.x + eGFR, data = incident_data)
+    model4 <- coxph(Surv(time_to_event, event) ~ get(protein) + age.y + sex.y + nonwhite +fast_hrs+ townsend  + PA + alcohol_cat + ckm, data = incident_data)
     
-    # Extract results for all models
-    models <- list(model1, model2, model3)
+# Extract results for all models
+    models <- list(model1, model2, model3, model4)
     for (i in seq_along(models)) {
       model <- models[[i]]
       coef_val <- coef(model)[1]
@@ -310,12 +314,31 @@ for (threshold in thresholds) {
     paste0("/n/home_fasse/txia/UKB_CKM/Data/Significant_ckm1vs0_Model3_FDR_Threshold_", threshold, ".csv"),
     row.names = FALSE
   )
+
+  # Extract Model 4 significant results (Model 2 + ckm)
+  model4_results <- annotated_results %>% filter(Model == "Model 4")
+  
+  # Save Model 4 Bonferroni < 0.05 results
+  bonferroni_results_model4 <- model4_results %>% filter(Bonferroni_P < 0.05)
+  write.csv(
+    bonferroni_results_model4,
+    paste0("/n/home_fasse/txia/UKB_CKM/Data/Significant_ckm1vs0_Model4_Bonferroni_Threshold_", threshold, ".csv"),
+    row.names = FALSE
+  )
+  
+  # Save Model 4 FDR < 0.05 results
+  fdr_results_model4 <- model4_results %>% filter(FDR < 0.05)
+  write.csv(
+    fdr_results_model4,
+    paste0("/n/home_fasse/txia/UKB_CKM/Data/Significant_ckm1vs0_Model4_FDR_Threshold_", threshold, ".csv"),
+    row.names = FALSE
+  )
   
   cat("Analysis complete for threshold:", threshold, "\n")
 }
 
 
-# Step: Add Continuous, Tertile, and Spline Models for protein_score and Threshold Scores
+# Step: Add Continuous, Quintile, and Spline Models for protein_score and Threshold Scores
 print("Running all Cox models for continuous, tertile, and spline protein scores...")
 
 # List of protein score variants
@@ -334,18 +357,21 @@ run_models_on_subset <- function(data, label) {
   data$fast_hrs <- as.factor(data$fast_hrs)
   data$alcohol_cat <- as.factor(data$alcohol_cat)
   data$smoke <- as.factor(data$smoke)
+  data$ckm <- as.factor(data$ckm)
 
   for (score_var in protein_scores) {
     print(paste("Processing:", score_var, "in group", label))
 
     ### 1. Continuous Cox Models
-   for (i in 1:3) {
+   for (i in 1:4) {
       if (i == 1) {
         model <- coxph(Surv(time_to_event, event) ~ get(score_var) + age.y + sex.y, data = data)
       } else if (i == 2) {
-        model <- coxph(Surv(time_to_event, event) ~ get(score_var) + age.y + sex.y + nonwhite +fast_hrs+ townsend + smoke + PA + BMI + alcohol_cat, data = data)
+        model <- coxph(Surv(time_to_event, event) ~ get(score_var) + age.y + sex.y + nonwhite +fast_hrs+ townsend + PA  + alcohol_cat, data = data)
       } else if (i == 3) {
         model <- coxph(Surv(time_to_event, event) ~ get(score_var) + age.y + sex.y + nonwhite +fast_hrs+ townsend + smoke + PA + BMI + alcohol_cat +sbp_use +  f.30690.0.0.x + f.30760.0.0.x +  f.30740.0.0.x + eGFR, data = data)
+      } else if (i == 4) {
+        model <- coxph(Surv(time_to_event, event) ~ get(score_var) + age.y + sex.y + nonwhite +fast_hrs+ townsend  + PA  + alcohol_cat + ckm, data = data)
       }
 
       coef_val <- coef(model)[1]
@@ -370,7 +396,7 @@ run_models_on_subset <- function(data, label) {
       ))
     }
 
-    ### 2. Tertile Models
+    ### 2. Quintile Models
     tertile_var <- paste0(score_var, "_tertile")
 
 data <- data %>%
@@ -383,13 +409,15 @@ data <- data %>%
     !!tertile_var := stats::relevel(.data[[tertile_var]], ref = "T1")
   )
 
-    for (i in 1:3) {
+    for (i in 1:4) {
       if (i == 1) {
         model <- coxph(Surv(time_to_event, event) ~ get(tertile_var) + age.y + sex.y, data = data)
       } else if (i == 2) {
-        model <- coxph(Surv(time_to_event, event) ~ get(tertile_var) + age.y + sex.y + nonwhite +fast_hrs+ townsend + smoke + PA + BMI + alcohol_cat, data = data)
+        model <- coxph(Surv(time_to_event, event) ~ get(tertile_var) + age.y + sex.y + nonwhite +fast_hrs+ townsend  + PA  + alcohol_cat, data = data)
       } else if (i == 3) {
         model <- coxph(Surv(time_to_event, event) ~ get(tertile_var) + age.y + sex.y + nonwhite +fast_hrs+ townsend + smoke + PA + BMI + alcohol_cat +sbp_use +  f.30690.0.0.x + f.30760.0.0.x +  f.30740.0.0.x + eGFR, data = data)
+      } else if (i == 4) {
+        model <- coxph(Surv(time_to_event, event) ~ get(tertile_var) + age.y + sex.y + nonwhite +fast_hrs+ townsend  + PA  + alcohol_cat + ckm, data = data)
       }
 
 
@@ -452,6 +480,13 @@ new_data$`f.30740.0.0.x` <- median(as.numeric(data$`f.30740.0.0.x`), na.rm = TRU
 
 new_data$eGFR <- median(as.numeric(data$eGFR), na.rm = TRUE)
 
+# Set ckm for Model 4 spline predictions
+if (is.factor(data$ckm)) {
+  new_data$ckm <- factor(rep(levels(data$ckm)[1], 100), levels = levels(data$ckm))
+} else {
+  new_data$ckm <- median(as.numeric(data$ckm), na.rm = TRUE)
+}
+
 # Predict log(HR) and calculate CI correctly
 spline_pred <- predict(spline_model, newdata = new_data, type = "lp", se.fit = TRUE)
 
@@ -462,6 +497,17 @@ new_data$HR_upper <- exp(spline_pred$fit + 1.96 * spline_pred$se.fit)
 
 
     fwrite(new_data, paste0("/n/home_fasse/txia/UKB_CKM/Data/spline_ckd_ckm1vs0_", score_var, "_model3_", label, ".csv"))
+
+    # Fit and save Model 4 spline model (Model 2 + ckm)
+    spline_model4 <- coxph(Surv(time_to_event, event) ~ ns(get(score_var), df = 4) + 
+      age.y + sex.y + nonwhite +fast_hrs+ townsend + PA + alcohol_cat + ckm,
+      data = data)
+    spline_pred4 <- predict(spline_model4, newdata = new_data, type = "lp", se.fit = TRUE)
+    new_data_model4 <- new_data
+    new_data_model4$HR <- exp(spline_pred4$fit)
+    new_data_model4$HR_lower <- exp(spline_pred4$fit - 1.96 * spline_pred4$se.fit)
+    new_data_model4$HR_upper <- exp(spline_pred4$fit + 1.96 * spline_pred4$se.fit)
+    fwrite(new_data_model4, paste0("/n/home_fasse/txia/UKB_CKM/Data/spline_ckd_ckm1vs0_", score_var, "_model4_", label, ".csv"))
   }
 }
 
@@ -487,7 +533,7 @@ write.csv(
   row.names = FALSE
 )
 
-print("Completed all models for all protein score thresholds including spline models, stratified by drug use.")
+print("Completed all models for all protein score thresholds including spline models and Model 4 (Model 2 + ckm), stratified by drug use.")
 
 
 #########EVENT AND TIME DISTIRBUTION
@@ -690,6 +736,8 @@ cat("99% percentile:", round(p99_0.2, 4), "\n")
 
 cat("\n=== Outliers Based on IQR Rule ===\n")
 print(outliers_0.2)
+
+
 
 
 
